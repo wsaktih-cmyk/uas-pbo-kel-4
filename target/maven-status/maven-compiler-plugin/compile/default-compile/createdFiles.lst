@@ -1,0 +1,4 @@
+com\musicplayer\Main.class
+com\musicplayer\view\SplashScreen.class
+com\musicplayer\controller\PlaylistController.class
+com\musicplayer\model\Song.class
