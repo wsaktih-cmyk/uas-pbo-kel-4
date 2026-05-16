@@ -13,6 +13,10 @@ public class Song {
     private final StringProperty genre;
     private final BooleanProperty liked;
     private final StringProperty coverEmoji;
+    private String fileUrl;
+
+    public String getFileUrl() { return fileUrl; }
+public void setFileUrl(String fileUrl) { this.fileUrl = fileUrl; }
 
     public Song(String title, String artist, String album, 
                 String duration, String genre, String coverEmoji) {
