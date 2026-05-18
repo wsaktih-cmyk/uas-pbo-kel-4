@@ -51,4 +51,8 @@ public void setFileUrl(String fileUrl) { this.fileUrl = fileUrl; }
 
     public String getCoverEmoji() { return coverEmoji.get(); }
     public StringProperty coverEmojiProperty() { return coverEmoji; }
+
+    public void setDuration(String durationStr) {
+        this.duration.set(durationStr);
+    }
 }

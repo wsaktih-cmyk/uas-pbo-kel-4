@@ -2,6 +2,7 @@ package com.musicplayer.controller;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -9,10 +10,8 @@ import java.util.Optional;
 import com.musicplayer.model.Song;
 
 import javafx.animation.FadeTransition;
-import javafx.animation.Interpolator;
 import javafx.animation.ParallelTransition;
 import javafx.animation.ScaleTransition;
-import javafx.animation.TranslateTransition;
 import javafx.application.Platform;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
@@ -27,6 +26,7 @@ import javafx.scene.control.ButtonType;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.Dialog;
 import javafx.scene.control.Label;
+import javafx.scene.control.ListCell;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.control.ScrollPane;
 import javafx.scene.control.Separator;
@@ -55,13 +55,13 @@ import javafx.util.Duration;
 public class PlaylistController {
 
     private Stage stage;
-    private ObservableList<Song> allSongs;
-    private ObservableList<Song> filteredSongs;
+    private ObservableList<Song> allSongs = FXCollections.observableArrayList();
+    private ObservableList<Song> filteredSongs = FXCollections.observableArrayList();
     private Song currentSong;
     private int currentIndex = 0;
     private boolean isPlaying = false;
     
-    // UI Variables
+    // UI Components
     private Label nowPlayingTitle;
     private Label nowPlayingArtist;
     private Label playBtn;
@@ -73,17 +73,16 @@ public class PlaylistController {
     private Label sectionSubtitleLabel;
     private Button addSongBtn;
 
-    // Custom Playlist & Media Variables
+    // Playlist & Media
     private VBox customPlaylistContainer;
     private Map<String, ObservableList<Song>> playlistMap = new HashMap<>();
     private ComboBox<String> playlistSelector = new ComboBox<>();
-    private int playlistCounter = 1;
     private MediaPlayer mediaPlayer;
 
     public void initAndShow(Stage primaryStage) {
         this.stage = primaryStage;
         
-        initFallbackLocalData();
+        loadSongsFromSupabase();
         
         BorderPane root = buildMainUI();
         
@@ -100,86 +99,172 @@ public class PlaylistController {
         enableDrag(root, stage);
     }
 
-    private void initFallbackLocalData() {
-        allSongs = FXCollections.observableArrayList(
-            new Song("Blinding Lights", "The Weeknd", "After Hours", "3:20", "Synth-pop", "🌃"),
-            new Song("As It Was", "Harry Styles", "Harry's House", "2:37", "Indie Pop", "🏠"),
-            new Song("Stay", "The Kid LAROI & Justin Bieber", "F*CK LOVE 3", "2:21", "Pop", "💫")
-        );
-        
-        for (Song s : allSongs) {
-            s.setFileUrl("https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3");
-        }
+    // ============================================================
+    // SUPABASE DATABASE LOGIC
+    // ============================================================
+    private void loadSongsFromSupabase() {
+        String sql = "SELECT * FROM songs ORDER BY id ASC";
+        try (Connection conn = com.musicplayer.model.DatabaseConfig.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql);
+             ResultSet rs = pstmt.executeQuery()) {
 
-        filteredSongs = FXCollections.observableArrayList(allSongs);
-        if (!allSongs.isEmpty()) {
-            currentSong = allSongs.get(0);
+            allSongs.clear();
+            while (rs.next()) {
+                Song song = new Song(
+                    rs.getString("title"),
+                    rs.getString("artist"),
+                    rs.getString("album"),
+                    rs.getString("duration"),
+                    rs.getString("genre"),
+                    rs.getString("cover_emoji")
+                );
+                song.setFileUrl(rs.getString("file_url"));
+                allSongs.add(song);
+            }
+            filteredSongs.setAll(allSongs);
+            
+            if (!allSongs.isEmpty()) {
+                currentSong = allSongs.get(0);
+            }
+        } catch (Exception e) {
+            System.err.println("Gagal sinkronisasi dengan Supabase Cloud.");
+            e.printStackTrace();
         }
     }
 
+    private void saveSongToSupabase(Song song) {
+        String sql = "INSERT INTO songs (title, artist, album, duration, genre, cover_emoji, file_url) VALUES (?, ?, ?, ?, ?, ?, ?)";
+        try (Connection conn = com.musicplayer.model.DatabaseConfig.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+
+            pstmt.setString(1, song.getTitle());
+            pstmt.setString(2, song.getArtist());
+            pstmt.setString(3, song.getAlbum());
+            pstmt.setString(4, song.getDuration());
+            pstmt.setString(5, song.getGenre());
+            pstmt.setString(6, song.getCoverEmoji());
+            pstmt.setString(7, song.getFileUrl());
+            pstmt.executeUpdate();
+
+            allSongs.add(song);
+            filteredSongs.setAll(allSongs);
+            refreshSongList();
+
+            Alert success = new Alert(Alert.AlertType.INFORMATION);
+            success.setHeaderText(null);
+            success.setContentText("Lagu berhasil dikirim ke Supabase!");
+            success.show();
+        } catch (Exception e) {
+            allSongs.add(song);
+            filteredSongs.setAll(allSongs);
+            refreshSongList();
+            
+            Alert alert = new Alert(Alert.AlertType.WARNING);
+            alert.setHeaderText(null);
+            alert.setContentText("Gagal simpan ke cloud, lagu disimpan lokal sementara.\nError: " + e.getMessage());
+            alert.show();
+        }
+    }
+
+    private void deleteSongFromSupabase(Song song) {
+        String sql = "DELETE FROM songs WHERE title = ? AND artist = ?";
+        try (Connection conn = com.musicplayer.model.DatabaseConfig.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            
+            pstmt.setString(1, song.getTitle());
+            pstmt.setString(2, song.getArtist());
+            pstmt.executeUpdate();
+
+            allSongs.remove(song);
+            filteredSongs.setAll(allSongs);
+            
+            for (ObservableList<Song> pl : playlistMap.values()) {
+                pl.remove(song);
+            }
+            refreshSongList();
+
+            if (currentSong == song) {
+                if (mediaPlayer != null) { 
+                    mediaPlayer.stop(); 
+                    mediaPlayer.dispose(); 
+                    mediaPlayer = null; 
+                }
+                currentSong = null;
+                isPlaying = false;
+                nowPlayingTitle.setText("No Song");
+                nowPlayingArtist.setText("Unknown Artist");
+                playBtn.setText("▶");
+                currentTimeLabel.setText("0:00");
+                totalTimeLabel.setText("0:00");
+                seekBar.setProgress(0);
+            }
+        } catch (Exception e) {
+            allSongs.remove(song);
+            filteredSongs.setAll(allSongs);
+            refreshSongList();
+        }
+    }
+
+    // ============================================================
+    // MAIN UI BUILDER
+    // ============================================================
     private BorderPane buildMainUI() {
         BorderPane root = new BorderPane();
         root.setStyle("-fx-background-color: #0d0d1a; -fx-background-radius: 20;");
-
+        
         root.setTop(buildTitleBar());
         root.setLeft(buildSidebar());
         root.setCenter(buildPlaylistSection());
         root.setRight(buildNowPlayingPanel());
         root.setBottom(buildPlayerControls());
-
+        
         return root;
     }
 
-    // ============================================================
-    // TITLE BAR & WINDOW CONTROLS
-    // ============================================================
     private HBox buildTitleBar() {
         HBox bar = new HBox();
         bar.setPadding(new Insets(15, 20, 10, 20));
         bar.setAlignment(Pos.CENTER_LEFT);
-        bar.setStyle("-fx-background-color: transparent;");
-
+        
         Label logo = new Label("🎵 MELODIFY");
         logo.setStyle("-fx-font-size: 18px; -fx-font-weight: 900; -fx-text-fill: white; -fx-font-family: 'Segoe UI';");
         
         DropShadow logoGlow = new DropShadow();
-        logoGlow.setColor(Color.web("#a855f7"));
         logoGlow.setRadius(15);
+        logoGlow.setColor(Color.web("#a855f7"));
         logo.setEffect(logoGlow);
 
-        Region spacer = new Region();
+        Region spacer = new Region(); 
         HBox.setHgrow(spacer, Priority.ALWAYS);
-
-        Label minimize = createWindowBtn("—", "#f59e0b");
-        Label maximize = createWindowBtn("⬜", "#22c55e");
+        
+        Label min = createWindowBtn("—", "#f59e0b");
+        Label max = createWindowBtn("⬜", "#22c55e");
         Label close = createWindowBtn("✕", "#ef4444");
 
-        minimize.setOnMouseClicked(e -> stage.setIconified(true));
-        maximize.setOnMouseClicked(e -> stage.setMaximized(!stage.isMaximized()));
+        min.setOnMouseClicked(e -> stage.setIconified(true));
+        max.setOnMouseClicked(e -> stage.setMaximized(!stage.isMaximized()));
         close.setOnMouseClicked(e -> {
             if (mediaPlayer != null) mediaPlayer.stop();
-            FadeTransition ft = new FadeTransition(Duration.millis(300), stage.getScene().getRoot());
-            ft.setToValue(0);
-            ft.setOnFinished(ev -> stage.close());
-            ft.play();
+            stage.close();
         });
 
-        HBox windowControls = new HBox(8, minimize, maximize, close);
-        windowControls.setAlignment(Pos.CENTER);
-        bar.getChildren().addAll(logo, spacer, windowControls);
+        HBox controls = new HBox(8);
+        controls.getChildren().addAll(min, max, close);
+        
+        bar.getChildren().addAll(logo, spacer, controls);
         return bar;
     }
 
     private Label createWindowBtn(String text, String color) {
         Label btn = new Label(text);
-        btn.setStyle("-fx-font-size: 12px; -fx-text-fill: " + color + "; -fx-background-color: " + color + "33; -fx-background-radius: 50; -fx-padding: 4 8 4 8; -fx-cursor: hand;");
-        btn.setOnMouseEntered(e -> btn.setStyle("-fx-font-size: 12px; -fx-text-fill: white; -fx-background-color: " + color + "; -fx-background-radius: 50; -fx-padding: 4 8 4 8; -fx-cursor: hand;"));
-        btn.setOnMouseExited(e -> btn.setStyle("-fx-font-size: 12px; -fx-text-fill: " + color + "; -fx-background-color: " + color + "33; -fx-background-radius: 50; -fx-padding: 4 8 4 8; -fx-cursor: hand;"));
+        btn.setStyle("-fx-font-size: 12px; -fx-text-fill: " + color + "; -fx-background-color: " + color + "33; -fx-background-radius: 50; -fx-padding: 4 8; -fx-cursor: hand;");
+        btn.setOnMouseEntered(e -> btn.setStyle("-fx-font-size: 12px; -fx-text-fill: white; -fx-background-color: " + color + "; -fx-background-radius: 50; -fx-padding: 4 8; -fx-cursor: hand;"));
+        btn.setOnMouseExited(e -> btn.setStyle("-fx-font-size: 12px; -fx-text-fill: " + color + "; -fx-background-color: " + color + "33; -fx-background-radius: 50; -fx-padding: 4 8; -fx-cursor: hand;"));
         return btn;
     }
 
     // ============================================================
-    // SIDEBAR & PLAYLIST MANAGEMENT
+    // SIDEBAR & PLAYLISTS
     // ============================================================
     private VBox buildSidebar() {
         VBox sidebar = new VBox(8);
@@ -187,41 +272,36 @@ public class PlaylistController {
         sidebar.setPadding(new Insets(10, 15, 20, 15));
         sidebar.setStyle("-fx-background-color: #111127; -fx-border-color: transparent #1e1e3a transparent transparent; -fx-border-width: 0 1 0 0;");
 
-        String[][] menuItems = {
-            {"🏠", "Home"}, {"🔍", "Discover"}, {"💖", "Liked Songs"}, {"📥", "Downloads"}
-        };
+        sidebar.getChildren().add(createSidebarItem("🏠", "Home", true));
+        sidebar.getChildren().add(createSidebarItem("🔍", "Discover", false));
+        sidebar.getChildren().add(createSidebarItem("💖", "Liked Songs", false));
 
-        for (int i = 0; i < menuItems.length; i++) {
-            HBox item = createSidebarItem(menuItems[i][0], menuItems[i][1], i == 0);
-            sidebar.getChildren().add(item);
-        }
-
-        Separator sep = new Separator();
+        Separator sep = new Separator(); 
         sep.setStyle("-fx-background-color: #1e1e3a;");
         
-        HBox playlistHeaderBox = new HBox();
-        playlistHeaderBox.setAlignment(Pos.CENTER_LEFT);
-        playlistHeaderBox.setPadding(new Insets(15, 5, 5, 5));
+        HBox pHeaderBox = new HBox(); 
+        pHeaderBox.setAlignment(Pos.CENTER_LEFT); 
+        pHeaderBox.setPadding(new Insets(15, 5, 5, 5));
         
-        Label playlistHeader = new Label("MY PLAYLISTS");
-        playlistHeader.setStyle("-fx-font-size: 10px; -fx-text-fill: rgba(255,255,255,0.3); -fx-font-weight: bold;");
+        Label pHeader = new Label("MY PLAYLISTS"); 
+        pHeader.setStyle("-fx-font-size: 10px; -fx-text-fill: rgba(255,255,255,0.3); -fx-font-weight: bold;");
         
-        Region headerSpacer = new Region();
-        HBox.setHgrow(headerSpacer, Priority.ALWAYS);
+        Region sp = new Region(); 
+        HBox.setHgrow(sp, Priority.ALWAYS);
         
-        Label addPlaylistBtn = new Label("➕");
-        addPlaylistBtn.setStyle("-fx-text-fill: #a855f7; -fx-font-size: 12px; -fx-cursor: hand;");
-        addPlaylistBtn.setOnMouseClicked(e -> handleCreatePlaylist());
+        Label addPBtn = new Label("➕"); 
+        addPBtn.setStyle("-fx-text-fill: #a855f7; -fx-font-size: 12px; -fx-cursor: hand;");
+        addPBtn.setOnMouseClicked(e -> handleCreatePlaylist());
         
-        playlistHeaderBox.getChildren().addAll(playlistHeader, headerSpacer, addPlaylistBtn);
+        pHeaderBox.getChildren().addAll(pHeader, sp, addPBtn);
 
         customPlaylistContainer = new VBox(5);
-        sidebar.getChildren().addAll(sep, playlistHeaderBox, customPlaylistContainer);
+        sidebar.getChildren().addAll(sep, pHeaderBox, customPlaylistContainer);
         
-        Region spacer = new Region();
+        Region spacer = new Region(); 
         VBox.setVgrow(spacer, Priority.ALWAYS);
         sidebar.getChildren().addAll(spacer, createUserProfile());
-
+        
         return sidebar;
     }
 
@@ -230,171 +310,163 @@ public class PlaylistController {
         dialog.setTitle("Create New Playlist");
         dialog.setHeaderText("Bikin playlist kustom baru lu bre");
         dialog.setContentText("Masukkan nama playlist:");
-
+        
         Optional<String> result = dialog.showAndWait();
         result.ifPresent(name -> {
-            String playlistName = name.trim();
-            if (!playlistName.isEmpty() && !playlistMap.containsKey(playlistName)) {
-                playlistMap.put(playlistName, FXCollections.observableArrayList());
-                playlistSelector.getItems().add(playlistName);
-                HBox newPlaylistRow = createPlaylistSidebarItem("🎵", playlistName, "0 songs");
-                customPlaylistContainer.getChildren().add(newPlaylistRow);
+            String pName = name.trim();
+            if (!pName.isEmpty() && !playlistMap.containsKey(pName)) {
+                playlistMap.put(pName, FXCollections.observableArrayList());
+                playlistSelector.getItems().add(pName);
+                customPlaylistContainer.getChildren().add(createPlaylistSidebarItem("🎵", pName, "0 songs"));
             }
         });
     }
 
     private HBox createSidebarItem(String icon, String text, boolean isInitiallyActive) {
-        HBox item = new HBox(12);
-        item.setPadding(new Insets(12, 15, 12, 15));
-        item.setAlignment(Pos.CENTER_LEFT);
+        HBox item = new HBox(12); 
+        item.setPadding(new Insets(12, 15, 12, 15)); 
+        item.setAlignment(Pos.CENTER_LEFT); 
         item.setCursor(javafx.scene.Cursor.HAND);
-
-        Label iconLabel = new Label(icon);
+        
+        Label iconLabel = new Label(icon); 
         iconLabel.setStyle("-fx-font-size: 18px;");
-
-        Label textLabel = new Label(text);
-        textLabel.setStyle("-fx-font-size: 14px; -fx-font-weight: " + (isInitiallyActive ? "bold" : "normal") + "; -fx-text-fill: " + (isInitiallyActive ? "white" : "rgba(255,255,255,0.6)") + "; -fx-font-family: 'Segoe UI';");
-
-        Rectangle indicator = new Rectangle(3, 20);
-        indicator.setFill(new LinearGradient(0, 0, 0, 1, true, CycleMethod.NO_CYCLE, new Stop(0, Color.web("#a855f7")), new Stop(1, Color.web("#06b6d4"))));
+        
+        Label textLabel = new Label(text); 
+        textLabel.setStyle("-fx-font-size: 14px; -fx-font-weight: " + (isInitiallyActive ? "bold" : "normal") + "; -fx-text-fill: " + (isInitiallyActive ? "white" : "rgba(255,255,255,0.6)") + ";");
+        
+        Rectangle indicator = new Rectangle(3, 20); 
+        indicator.setFill(new LinearGradient(0,0,0,1,true,CycleMethod.NO_CYCLE, new Stop(0, Color.web("#a855f7")), new Stop(1, Color.web("#06b6d4"))));
         indicator.setVisible(isInitiallyActive);
-
-        if (isInitiallyActive) item.setStyle("-fx-background-color: linear-gradient(to right, #a855f720, #06b6d410); -fx-background-radius: 12;");
-        else item.setStyle("-fx-background-color: transparent; -fx-background-radius: 12;");
-
+        
+        if (isInitiallyActive) {
+            item.setStyle("-fx-background-color: linear-gradient(to right, #a855f720, #06b6d410); -fx-background-radius: 12;");
+        }
+        
         item.getChildren().addAll(indicator, iconLabel, textLabel);
 
         item.setOnMouseClicked(e -> {
             switch (text) {
                 case "Home":
-                    sectionTitleLabel.setText("Home");
+                    sectionTitleLabel.setText("Home"); 
                     sectionSubtitleLabel.setText("Welcome back! Ready to listen to some music?");
-                    addSongBtn.setVisible(true);
-                    filteredSongs.clear(); filteredSongs.addAll(allSongs);
+                    addSongBtn.setVisible(true); 
+                    filteredSongs.setAll(allSongs); 
                     break;
                 case "Discover":
-                    sectionTitleLabel.setText("Discover");
-                    sectionSubtitleLabel.setText("Explore new tracks and trending genres");
-                    addSongBtn.setVisible(false);
-                    filteredSongs.clear(); filteredSongs.addAll(allSongs);
+                    sectionTitleLabel.setText("Discover"); 
+                    sectionSubtitleLabel.setText("Rekomendasi hits viral buat lu hari ini 🔥");
+                    addSongBtn.setVisible(false); 
+                    
+                    // JURUS MAGIC: Ngacak urutan lagu biar berasa kayak dikasih "Rekomendasi" baru
+                    filteredSongs.clear();
+                    filteredSongs.addAll(allSongs);
+                    java.util.Collections.shuffle(filteredSongs); 
+                    
                     break;
                 case "Liked Songs":
-                    sectionTitleLabel.setText("Liked Songs");
+                    sectionTitleLabel.setText("Liked Songs"); 
                     sectionSubtitleLabel.setText("Your absolute favorites 💖");
-                    addSongBtn.setVisible(false);
-                    filteredSongs.clear();
-                    allSongs.stream().filter(Song::isLiked).forEach(filteredSongs::add);
-                    break;
-                case "Downloads":
-                    sectionTitleLabel.setText("Downloads");
-                    sectionSubtitleLabel.setText("Offline storage mode enabled");
-                    addSongBtn.setVisible(false);
-                    filteredSongs.clear();
+                    addSongBtn.setVisible(false); 
+                    filteredSongs.clear(); 
+                    allSongs.stream().filter(Song::isLiked).forEach(filteredSongs::add); 
                     break;
             }
             refreshSongList();
-
+            
             VBox parent = (VBox) item.getParent();
             for (Node node : parent.getChildren()) {
-                if (node instanceof HBox && !((HBox)node).getChildren().isEmpty() && ((HBox)node).getChildren().get(0) instanceof Rectangle) {
+                if (node instanceof HBox) {
                     HBox sibling = (HBox) node;
-                    Rectangle ind = (Rectangle) sibling.getChildren().get(0);
-                    Label lbl = (Label) sibling.getChildren().get(2);
-                    ind.setVisible(false);
-                    sibling.setStyle("-fx-background-color: transparent; -fx-background-radius: 12;");
-                    lbl.setStyle("-fx-font-size: 14px; -fx-font-weight: normal; -fx-text-fill: rgba(255,255,255,0.6);");
+                    if (!sibling.getChildren().isEmpty() && sibling.getChildren().get(0) instanceof Rectangle) {
+                        Rectangle ind = (Rectangle) sibling.getChildren().get(0);
+                        Label lbl = (Label) sibling.getChildren().get(2);
+                        ind.setVisible(false);
+                        sibling.setStyle("-fx-background-color: transparent;");
+                        lbl.setStyle("-fx-font-size: 14px; -fx-font-weight: normal; -fx-text-fill: rgba(255,255,255,0.6);");
+                    }
                 }
             }
             indicator.setVisible(true);
             item.setStyle("-fx-background-color: linear-gradient(to right, #a855f720, #06b6d410); -fx-background-radius: 12;");
             textLabel.setStyle("-fx-font-size: 14px; -fx-font-weight: bold; -fx-text-fill: white;");
         });
-
+        
         return item;
     }
 
     private HBox createPlaylistSidebarItem(String emoji, String name, String count) {
-        HBox item = new HBox(10);
-        item.setPadding(new Insets(8, 15, 8, 15));
-        item.setAlignment(Pos.CENTER_LEFT);
+        HBox item = new HBox(10); 
+        item.setPadding(new Insets(8, 15, 8, 15)); 
+        item.setAlignment(Pos.CENTER_LEFT); 
         item.setCursor(javafx.scene.Cursor.HAND);
-        item.setStyle("-fx-background-radius: 10;");
-
-        Label emojiLabel = new Label(emoji);
-        emojiLabel.setStyle("-fx-font-size: 16px; -fx-background-color: #ffffff15; -fx-background-radius: 8; -fx-padding: 6 8 6 8;");
-
-        VBox info = new VBox(2);
-        Label nameLabel = new Label(name);
-        nameLabel.setStyle("-fx-font-size: 13px; -fx-text-fill: rgba(255,255,255,0.8);");
-        Label countLabel = new Label(count);
-        countLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: rgba(255,255,255,0.4);");
-        info.getChildren().addAll(nameLabel, countLabel);
-
-        Region spacer = new Region();
-        HBox.setHgrow(spacer, Priority.ALWAYS);
-
-        Label deleteBtn = new Label("🗑️");
-        deleteBtn.setStyle("-fx-font-size: 14px; -fx-cursor: hand;");
-        deleteBtn.setVisible(false);
         
-        item.getChildren().addAll(emojiLabel, info, spacer, deleteBtn);
+        Label em = new Label(emoji); 
+        em.setStyle("-fx-font-size: 16px; -fx-background-color: #ffffff15; -fx-background-radius: 8; -fx-padding: 6 8;");
+        
+        VBox info = new VBox(2);
+        Label nameLbl = new Label(name);
+        nameLbl.setStyle("-fx-font-size: 13px; -fx-text-fill: rgba(255,255,255,0.8);");
+        Label countLbl = new Label(count);
+        countLbl.setStyle("-fx-font-size: 11px; -fx-text-fill: rgba(255,255,255,0.4);");
+        info.getChildren().addAll(nameLbl, countLbl);
+        
+        Region sp = new Region(); 
+        HBox.setHgrow(sp, Priority.ALWAYS);
+        
+        Label del = new Label("🗑️"); 
+        del.setStyle("-fx-font-size: 14px; -fx-cursor: hand;"); 
+        del.setVisible(false);
+        
+        item.getChildren().addAll(em, info, sp, del);
 
-        item.setOnMouseEntered(e -> { item.setStyle("-fx-background-color: #ffffff08; -fx-background-radius: 10;"); deleteBtn.setVisible(true); });
-        item.setOnMouseExited(e -> { item.setStyle("-fx-background-color: transparent; -fx-background-radius: 10;"); deleteBtn.setVisible(false); });
-
-        deleteBtn.setOnMouseClicked(e -> {
-            e.consume();
-            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
-            confirm.setTitle("Hapus Playlist");
-            confirm.setHeaderText(null);
-            confirm.setContentText("Yakin mau hapus playlist '" + name + "'?");
-            
-            confirm.showAndWait().ifPresent(response -> {
-                if (response == ButtonType.OK) {
-                    playlistMap.remove(name);
-                    playlistSelector.getItems().remove(name);
-                    customPlaylistContainer.getChildren().remove(item);
-                    
-                    if (sectionTitleLabel != null && sectionTitleLabel.getText().equals(name)) {
-                        sectionTitleLabel.setText("Home");
-                        filteredSongs.clear(); filteredSongs.addAll(allSongs);
-                        refreshSongList();
-                    }
-                }
-            });
+        item.setOnMouseEntered(e -> { 
+            item.setStyle("-fx-background-color: #ffffff08; -fx-background-radius: 10;"); 
+            del.setVisible(true); 
         });
-
-        item.setOnMouseClicked(e -> {
-            if (sectionTitleLabel != null) {
-                sectionTitleLabel.setText(name);
-                sectionSubtitleLabel.setText("Custom User Playlist");
-                addSongBtn.setVisible(true);
-                filteredSongs.clear();
-                ObservableList<Song> savedSongs = playlistMap.get(name);
-                if (savedSongs != null) filteredSongs.addAll(savedSongs);
-                refreshSongList();
+        item.setOnMouseExited(e -> { 
+            item.setStyle("-fx-background-color: transparent;"); 
+            del.setVisible(false); 
+        });
+        del.setOnMouseClicked(e -> {
+            e.consume();
+            playlistMap.remove(name); 
+            playlistSelector.getItems().remove(name);
+            customPlaylistContainer.getChildren().remove(item);
+            if (sectionTitleLabel.getText().equals(name)) { 
+                sectionTitleLabel.setText("Home"); 
+                filteredSongs.setAll(allSongs); 
+                refreshSongList(); 
             }
         });
-
+        item.setOnMouseClicked(e -> {
+            sectionTitleLabel.setText(name); 
+            sectionSubtitleLabel.setText("Custom User Playlist Collection");
+            filteredSongs.clear(); 
+            ObservableList<Song> saved = playlistMap.get(name);
+            if (saved != null) {
+                filteredSongs.addAll(saved);
+            }
+            refreshSongList();
+        });
         return item;
     }
 
     private HBox createUserProfile() {
-        HBox profile = new HBox(10);
-        profile.setPadding(new Insets(12, 15, 12, 15));
-        profile.setAlignment(Pos.CENTER_LEFT);
+        HBox profile = new HBox(10); 
+        profile.setPadding(new Insets(12, 15, 12, 15)); 
+        profile.setAlignment(Pos.CENTER_LEFT); 
         profile.setStyle("-fx-background-color: #ffffff08; -fx-background-radius: 12;");
-
-        Label avatar = new Label("👤");
-        avatar.setStyle("-fx-font-size: 28px; -fx-background-color: linear-gradient(to bottom right, #a855f7, #06b6d4); -fx-background-radius: 50; -fx-padding: 5 8 5 8;");
-
+        
+        Label avatar = new Label("👤"); 
+        avatar.setStyle("-fx-font-size: 24px; -fx-background-color: linear-gradient(to bottom right, #a855f7, #06b6d4); -fx-background-radius: 50; -fx-padding: 5 8;");
+        
         VBox info = new VBox(2);
-        Label name = new Label("Wishang Sakti");
-        name.setStyle("-fx-font-size: 13px; -fx-font-weight: bold; -fx-text-fill: white;");
-        Label plan = new Label("Premium ✓");
-        plan.setStyle("-fx-font-size: 11px; -fx-text-fill: #a855f7;");
-        info.getChildren().addAll(name, plan);
-
+        Label nameLbl = new Label("Wishang Sakti");
+        nameLbl.setStyle("-fx-font-size: 13px; -fx-font-weight: bold; -fx-text-fill: white;");
+        Label planLbl = new Label("Premium ✓");
+        planLbl.setStyle("-fx-font-size: 11px; -fx-text-fill: #a855f7;");
+        info.getChildren().addAll(nameLbl, planLbl);
+        
         profile.getChildren().addAll(avatar, info);
         return profile;
     }
@@ -403,79 +475,83 @@ public class PlaylistController {
     // CENTER PLAYLIST UI
     // ============================================================
     private VBox buildPlaylistSection() {
-        VBox container = new VBox(0);
+        VBox container = new VBox(0); 
         container.setStyle("-fx-background-color: #0d0d1a;");
-
-        HBox header = new HBox(15);
-        header.setPadding(new Insets(10, 25, 15, 25));
-        header.setAlignment(Pos.CENTER_LEFT);
-
-        VBox titleBox = new VBox(4);
-        sectionTitleLabel = new Label("Home");
-        sectionTitleLabel.setStyle("-fx-font-size: 26px; -fx-font-weight: 900; -fx-text-fill: white; -fx-font-family: 'Segoe UI';");
-        sectionSubtitleLabel = new Label("Welcome back! Ready to listen to some music?");
-        sectionSubtitleLabel.setStyle("-fx-font-size: 13px; -fx-text-fill: rgba(255,255,255,0.5);");
-        titleBox.getChildren().addAll(sectionTitleLabel, sectionSubtitleLabel);
-
-        Region spacer = new Region();
-        HBox.setHgrow(spacer, Priority.ALWAYS);
-
-        HBox searchBox = new HBox(8);
-        searchBox.setAlignment(Pos.CENTER);
-        searchBox.setStyle("-fx-background-color: #1a1a2e; -fx-background-radius: 25; -fx-padding: 8 15 8 15;");
         
+        HBox header = new HBox(15); 
+        header.setPadding(new Insets(10, 25, 15, 25)); 
+        header.setAlignment(Pos.CENTER_LEFT);
+        
+        VBox tBox = new VBox(4);
+        sectionTitleLabel = new Label("Home");
+        sectionSubtitleLabel = new Label("Welcome back! Ready to listen to some music?");
+        sectionTitleLabel.setStyle("-fx-font-size: 26px; -fx-font-weight: 900; -fx-text-fill: white;");
+        sectionSubtitleLabel.setStyle("-fx-font-size: 13px; -fx-text-fill: rgba(255,255,255,0.5);");
+        tBox.getChildren().addAll(sectionTitleLabel, sectionSubtitleLabel);
+
+        Region spacer = new Region(); 
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        
+        HBox sBox = new HBox(8);
         Label searchIcon = new Label("🔍");
         TextField searchField = new TextField();
+        sBox.setAlignment(Pos.CENTER); 
+        sBox.setStyle("-fx-background-color: #1a1a2e; -fx-background-radius: 25; -fx-padding: 8 15;");
         searchField.setPromptText("Search songs...");
-        searchField.setStyle("-fx-background-color: transparent; -fx-text-fill: white; -fx-prompt-text-fill: rgba(255,255,255,0.3); -fx-font-size: 13px; -fx-pref-width: 180px; -fx-border-color: transparent;");
-        searchBox.getChildren().addAll(searchIcon, searchField);
+        searchField.setStyle("-fx-background-color: transparent; -fx-text-fill: white; -fx-border-color: transparent; -fx-pref-width: 180px;");
+        sBox.getChildren().addAll(searchIcon, searchField);
 
         addSongBtn = new Button("+ Add Song");
-        addSongBtn.setStyle("-fx-background-color: linear-gradient(to right, #a855f7, #06b6d4); -fx-text-fill: white; -fx-font-weight: bold; -fx-font-size: 13px; -fx-background-radius: 25; -fx-padding: 10 20 10 20; -fx-cursor: hand; -fx-border-color: transparent;");
-        
+        addSongBtn.setStyle("-fx-background-color: linear-gradient(to right, #a855f7, #06b6d4); -fx-text-fill: white; -fx-font-weight: bold; -fx-background-radius: 25; -fx-padding: 10 20; -fx-cursor: hand; -fx-border-color: transparent;");
         addSongBtn.setOnAction(e -> openAddSongDialog());
+        
+        header.getChildren().addAll(tBox, spacer, sBox, addSongBtn);
 
-        header.getChildren().addAll(titleBox, spacer, searchBox, addSongBtn);
-
-        ScrollPane scrollPane = new ScrollPane();
-        scrollPane.setStyle("-fx-background-color: transparent; -fx-background: transparent; -fx-border-color: transparent;");
-        scrollPane.setFitToWidth(true);
-        scrollPane.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
-
-        songListContainer = new VBox(2);
+        ScrollPane sp = new ScrollPane(); 
+        sp.setStyle("-fx-background-color: transparent; -fx-background: transparent; -fx-border-color: transparent;"); 
+        sp.setFitToWidth(true); 
+        sp.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        
+        songListContainer = new VBox(2); 
         songListContainer.setPadding(new Insets(5, 20, 20, 20));
+        sp.setContent(songListContainer);
 
+        HBox colHeaders = new HBox(); 
+        colHeaders.setPadding(new Insets(5, 25, 8, 25)); 
+        colHeaders.setStyle("-fx-border-color: transparent transparent #1e1e3a transparent; -fx-border-width: 0 0 1 0;");
+        
+        String[] cNames = {"#", "TITLE", "ALBUM", "GENRE", "TIME", ""}; 
+        double[] widths = {40, 280, 180, 120, 60, 80};
+        for (int i = 0; i < cNames.length; i++) {
+            Label c = new Label(cNames[i]); 
+            c.setMinWidth(widths[i]); 
+            c.setMaxWidth(widths[i]); 
+            c.setStyle("-fx-font-size: 11px; -fx-text-fill: rgba(255,255,255,0.3); -fx-font-weight: bold;");
+            colHeaders.getChildren().add(c);
+        }
+
+        // Gambar UI lagu pertama kali saat di-load
         refreshSongList();
-        scrollPane.setContent(songListContainer);
 
-        searchField.textProperty().addListener((obs, oldVal, newVal) -> {
+        searchField.textProperty().addListener((obs, oldV, newV) -> {
             filteredSongs.clear();
-            if (newVal == null || newVal.isEmpty()) {
-                restoreSongsByActiveMenu(sectionTitleLabel.getText());
+            if (newV == null || newV.isEmpty()) {
+                if (sectionTitleLabel.getText().equals("Liked Songs")) {
+                    allSongs.stream().filter(Song::isLiked).forEach(filteredSongs::add);
+                } else if (playlistMap.containsKey(sectionTitleLabel.getText())) {
+                    filteredSongs.addAll(playlistMap.get(sectionTitleLabel.getText()));
+                } else {
+                    filteredSongs.addAll(allSongs);
+                }
             } else {
-                String lower = newVal.toLowerCase();
-                allSongs.stream()
-                    .filter(s -> s.getTitle().toLowerCase().contains(lower) || s.getArtist().toLowerCase().contains(lower))
-                    .forEach(filteredSongs::add);
+                String low = newV.toLowerCase();
+                allSongs.stream().filter(s -> s.getTitle().toLowerCase().contains(low) || s.getArtist().toLowerCase().contains(low)).forEach(filteredSongs::add);
             }
             refreshSongList();
         });
 
-        HBox columnHeaders = new HBox();
-        columnHeaders.setPadding(new Insets(5, 25, 8, 25));
-        columnHeaders.setStyle("-fx-border-color: transparent transparent #1e1e3a transparent; -fx-border-width: 0 0 1 0;");
-        String[] columnNames = {"#", "TITLE", "ALBUM", "GENRE", "TIME", ""};
-        double[] widths = {40, 280, 180, 120, 60, 80};
-        for (int i = 0; i < columnNames.length; i++) {
-            Label col = new Label(columnNames[i]);
-            col.setMinWidth(widths[i]); col.setMaxWidth(widths[i]);
-            col.setStyle("-fx-font-size: 11px; -fx-text-fill: rgba(255,255,255,0.3); -fx-font-weight: bold;");
-            columnHeaders.getChildren().add(col);
-        }
-
-        container.getChildren().addAll(header, columnHeaders, scrollPane);
-        VBox.setVgrow(scrollPane, Priority.ALWAYS);
-
+        container.getChildren().addAll(header, colHeaders, sp);
+        VBox.setVgrow(sp, Priority.ALWAYS);
         return container;
     }
 
@@ -486,284 +562,271 @@ public class PlaylistController {
         }
     }
 
-    // ============================================================
-    // SONG ROW (FIXED)
-    // ============================================================
     private HBox createSongRow(Song song, int number) {
-        boolean isCurrentSong = (currentSong != null && currentSong.equals(song));
+        HBox row = new HBox(); 
+        row.setAlignment(Pos.CENTER_LEFT); 
+        row.setPadding(new Insets(10, 5, 10, 5)); 
+        row.setCursor(javafx.scene.Cursor.HAND); 
+        row.setStyle("-fx-background-radius: 12;");
+        
+        boolean isCurrent = (song == currentSong);
+        if (isCurrent) {
+            row.setStyle("-fx-background-color: linear-gradient(to right, #a855f715, #06b6d410); -fx-background-radius: 12;");
+        }
 
-        HBox row = new HBox(0);
-        row.setPadding(new Insets(10, 5, 10, 5));
-        row.setAlignment(Pos.CENTER_LEFT);
-        row.setCursor(javafx.scene.Cursor.HAND);
-        row.setStyle(isCurrentSong
-            ? "-fx-background-color: linear-gradient(to right, #a855f720, #06b6d410); -fx-background-radius: 12;"
-            : "-fx-background-color: transparent;");
+        Label num = new Label(isCurrent ? "▶" : String.valueOf(number)); 
+        num.setStyle("-fx-text-fill: " + (isCurrent ? "#a855f7" : "rgba(255,255,255,0.4)") + ";");
+        StackPane numP = new StackPane(num); 
+        numP.setMinWidth(40);
 
-        // Kolom nomor
-        Label numLabel = new Label(isCurrentSong ? "♪" : String.valueOf(number));
-        numLabel.setMinWidth(40); numLabel.setMaxWidth(40);
-        numLabel.setStyle("-fx-font-size: 13px; -fx-text-fill: " + (isCurrentSong ? "#a855f7" : "rgba(255,255,255,0.4)") + ";");
+        HBox tSec = new HBox(12); 
+        tSec.setMinWidth(280); 
+        tSec.setAlignment(Pos.CENTER_LEFT);
+        
+        Rectangle cBg = new Rectangle(42, 42); 
+        cBg.setArcWidth(10); 
+        cBg.setArcHeight(10); 
+        cBg.setFill(Color.web("#a855f7"));
+        
+        Label cEm = new Label(song.getCoverEmoji() != null ? song.getCoverEmoji() : "🎵");
+        StackPane cov = new StackPane();
+        cov.getChildren().addAll(cBg, cEm);
+        
+        VBox sInfo = new VBox(3);
+        Label titleLbl = new Label(song.getTitle());
+        titleLbl.setStyle("-fx-text-fill: " + (isCurrent ? "#a855f7" : "white") + "; -fx-font-weight: bold;");
+        Label artistLbl = new Label(song.getArtist());
+        artistLbl.setStyle("-fx-text-fill: rgba(255,255,255,0.5); -fx-font-size: 12px;");
+        sInfo.getChildren().addAll(titleLbl, artistLbl);
+        
+        tSec.getChildren().addAll(cov, sInfo);
 
-        // Kolom judul & artis
-        VBox titleBox = new VBox(3);
-        titleBox.setMinWidth(280); titleBox.setMaxWidth(280);
-        Label titleLabel = new Label(song.getTitle());
-        titleLabel.setStyle("-fx-font-size: 14px; -fx-font-weight: bold; -fx-text-fill: " + (isCurrentSong ? "#a855f7" : "white") + ";");
-        Label artistLabel = new Label(song.getArtist());
-        artistLabel.setStyle("-fx-font-size: 12px; -fx-text-fill: rgba(255,255,255,0.5);");
-        titleBox.getChildren().addAll(titleLabel, artistLabel);
+        Label alb = new Label(song.getAlbum()); 
+        alb.setMinWidth(180); 
+        alb.setStyle("-fx-text-fill: rgba(255,255,255,0.5);");
+        
+        Label gen = new Label(song.getGenre()); 
+        gen.setMinWidth(120); 
+        gen.setStyle("-fx-text-fill: #06b6d4; -fx-background-color: #06b6d415; -fx-background-radius: 20; -fx-padding: 3 8; -fx-font-size: 11px;");
+        
+        Label dur = new Label(song.getDuration()); 
+        dur.setMinWidth(60); 
+        dur.setStyle("-fx-text-fill: rgba(255,255,255,0.5);");
 
-        // Kolom album
-        Label albumLabel = new Label(song.getAlbum());
-        albumLabel.setMinWidth(180); albumLabel.setMaxWidth(180);
-        albumLabel.setStyle("-fx-font-size: 13px; -fx-text-fill: rgba(255,255,255,0.5);");
-
-        // Kolom genre
-        Label genreLabel = new Label(song.getGenre());
-        genreLabel.setMinWidth(120); genreLabel.setMaxWidth(120);
-        genreLabel.setStyle("-fx-font-size: 12px; -fx-text-fill: rgba(255,255,255,0.4); -fx-background-color: #ffffff10; -fx-background-radius: 10; -fx-padding: 2 8 2 8;");
-
-        // Kolom durasi
-        Label durationLabel = new Label(song.getDuration());
-        durationLabel.setMinWidth(60); durationLabel.setMaxWidth(60);
-        durationLabel.setStyle("-fx-font-size: 13px; -fx-text-fill: rgba(255,255,255,0.4);");
-
-        // Kolom aksi (like + delete)
-        HBox actions = new HBox(12);
-        actions.setMinWidth(80);
-        actions.setAlignment(Pos.CENTER_RIGHT);
-
-        Label likeBtn = new Label(song.isLiked() ? "❤️" : "🤍");
-        likeBtn.setStyle("-fx-font-size: 16px; -fx-cursor: hand;");
-        likeBtn.setOnMouseClicked(e -> {
-            e.consume();
-            song.setLiked(!song.isLiked());
-            likeBtn.setText(song.isLiked() ? "❤️" : "🤍");
+        HBox acts = new HBox(12); 
+        acts.setMinWidth(80); 
+        acts.setAlignment(Pos.CENTER_RIGHT);
+        
+        Label lBtn = new Label(song.isLiked() ? "❤️" : "🤍"); 
+        lBtn.setStyle("-fx-font-size: 16px; -fx-cursor: hand;");
+        lBtn.setOnMouseClicked(e -> { 
+            e.consume(); 
+            song.setLiked(!song.isLiked()); 
+            lBtn.setText(song.isLiked() ? "❤️" : "🤍"); 
         });
-
-        Label deleteBtn = new Label("🗑️");
-        deleteBtn.setStyle("-fx-font-size: 15px; -fx-cursor: hand;");
-        deleteBtn.setVisible(false);
-
-        deleteBtn.setOnMouseClicked(e -> {
+        
+        Label del = new Label("🗑️"); 
+        del.setStyle("-fx-font-size: 15px; -fx-cursor: hand;"); 
+        del.setVisible(false);
+        del.setOnMouseClicked(e -> {
             e.consume();
-            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
-            confirm.setTitle("Hapus Lagu Permanen");
-            confirm.setHeaderText(null);
-            confirm.setContentText("Yakin lu mau musnahin lagu '" + song.getTitle() + "' dari Supabase?");
-            confirm.showAndWait().ifPresent(response -> {
-                if (response == ButtonType.OK) {
-                    deleteSongFromSupabase(song);
-                }
+            Alert c = new Alert(Alert.AlertType.CONFIRMATION);
+            c.setHeaderText(null);
+            c.setContentText("Hapus '" + song.getTitle() + "' permanen dari cloud?");
+            c.showAndWait().ifPresent(r -> { 
+                if (r == ButtonType.OK) deleteSongFromSupabase(song); 
             });
         });
+        
+        acts.getChildren().addAll(lBtn, del);
 
-        actions.getChildren().addAll(likeBtn, deleteBtn);
-
-        row.getChildren().addAll(numLabel, titleBox, albumLabel, genreLabel, durationLabel, actions);
-
-        // Hover effect — pakai effectively final variable
-        final boolean isCurrent = isCurrentSong;
-        row.setOnMouseEntered(e -> {
-            if (!isCurrent) row.setStyle("-fx-background-color: #ffffff08; -fx-background-radius: 12;");
-            deleteBtn.setVisible(true);
+        row.getChildren().addAll(numP, tSec, alb, gen, dur, acts);
+        row.setOnMouseEntered(e -> { 
+            if (!isCurrent) row.setStyle("-fx-background-color: #ffffff08; -fx-background-radius: 12;"); 
+            del.setVisible(true); 
         });
-        row.setOnMouseExited(e -> {
-            if (!isCurrent) row.setStyle("-fx-background-color: transparent;");
-            deleteBtn.setVisible(false);
+        row.setOnMouseExited(e -> { 
+            if (!isCurrent) row.setStyle("-fx-background-color: transparent;"); 
+            del.setVisible(false); 
         });
-
         row.setOnMouseClicked(e -> playSong(song));
-
         return row;
     }
 
     // ============================================================
-    // RIGHT PANEL (NOW PLAYING & ADD TO PLAYLIST)
+    // NOW PLAYING & RIGHT PANEL
     // ============================================================
     private VBox buildNowPlayingPanel() {
         VBox panel = new VBox(10); 
         panel.setPrefWidth(260); 
-        panel.setPadding(new Insets(10, 15, 10, 15));
+        panel.setPadding(new Insets(10, 15, 10, 15)); 
         panel.setStyle("-fx-background-color: #111127; -fx-border-color: transparent transparent transparent #1e1e3a; -fx-border-width: 0 0 0 1;");
-
-        Label panelTitle = new Label("NOW PLAYING");
-        panelTitle.setStyle("-fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: rgba(255,255,255,0.3);");
-
-        nowPlayingTitle = new Label(currentSong != null ? currentSong.getTitle() : "No Song");
-        nowPlayingTitle.setStyle("-fx-font-size: 16px; -fx-font-weight: bold; -fx-text-fill: white; -fx-wrap-text: true;");
-        nowPlayingTitle.setMaxWidth(230);
         
-        nowPlayingArtist = new Label(currentSong != null ? currentSong.getArtist() : "Unknown Artist");
+        Label pTitle = new Label("NOW PLAYING"); 
+        pTitle.setStyle("-fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: rgba(255,255,255,0.3);");
+
+        nowPlayingTitle = new Label(currentSong != null ? currentSong.getTitle() : "No Song"); 
+        nowPlayingTitle.setStyle("-fx-font-size: 16px; -fx-font-weight: bold; -fx-text-fill: white; -fx-wrap-text: true;");
+        
+        nowPlayingArtist = new Label(currentSong != null ? currentSong.getArtist() : "Unknown Artist"); 
         nowPlayingArtist.setStyle("-fx-text-fill: rgba(255,255,255,0.5); -fx-font-size: 12px;");
 
-        panel.getChildren().addAll(
-            panelTitle, 
-            createAlbumArt(), 
-            nowPlayingTitle, 
-            nowPlayingArtist, 
-            buildProgressSection(), 
-            buildVolumeSection(), 
-            buildAddToPlaylistSection() 
-        );
+        panel.getChildren().addAll(pTitle, createAlbumArt(), nowPlayingTitle, nowPlayingArtist, buildProgressSection(), buildVolumeSection(), buildAddToPlaylistSection());
         return panel;
     }
 
     private StackPane createAlbumArt() {
-        StackPane albumArt = new StackPane();
-        albumArt.setPrefSize(180, 180); 
-        
-        Rectangle artBg = new Rectangle(170, 170);
-        artBg.setArcWidth(25); artBg.setArcHeight(25);
+        Rectangle artBg = new Rectangle(170, 170); 
+        artBg.setArcWidth(25); 
+        artBg.setArcHeight(25);
         artBg.setFill(new LinearGradient(0,0,1,1,true,CycleMethod.NO_CYCLE, new Stop(0, Color.web("#a855f7")), new Stop(1, Color.web("#06b6d4"))));
         
-        DropShadow shadow = new DropShadow();
-        shadow.setColor(Color.web("#a855f760")); shadow.setRadius(20); shadow.setOffsetY(5);
-        artBg.setEffect(shadow);
+        DropShadow ds = new DropShadow();
+        ds.setRadius(20);
+        ds.setColor(Color.web("#a855f760"));
+        artBg.setEffect(ds);
         
-        Label bigEmoji = new Label("🎵");
-        bigEmoji.setStyle("-fx-font-size: 60px;");
+        Label emoji = new Label("🎵");
+        emoji.setStyle("-fx-font-size: 60px;");
         
-        albumArt.getChildren().addAll(artBg, bigEmoji);
-        return albumArt;
+        StackPane artPane = new StackPane();
+        artPane.getChildren().addAll(artBg, emoji);
+        return artPane;
     }
 
     private VBox buildProgressSection() {
-        VBox section = new VBox(8);
-        HBox timeRow = new HBox();
-        currentTimeLabel = new Label("0:00");
+        VBox sec = new VBox(8); 
+        HBox tRow = new HBox();
+        
+        currentTimeLabel = new Label("0:00"); 
         currentTimeLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: rgba(255,255,255,0.5);");
-        totalTimeLabel = new Label(currentSong != null ? currentSong.getDuration() : "0:00");
+        
+        totalTimeLabel = new Label(currentSong != null ? currentSong.getDuration() : "0:00"); 
         totalTimeLabel.setStyle("-fx-font-size: 11px; -fx-text-fill: rgba(255,255,255,0.5);");
-        Region sp = new Region(); HBox.setHgrow(sp, Priority.ALWAYS);
-        timeRow.getChildren().addAll(currentTimeLabel, sp, totalTimeLabel);
-
+        
+        Region sp = new Region(); 
+        HBox.setHgrow(sp, Priority.ALWAYS); 
+        
+        tRow.getChildren().addAll(currentTimeLabel, sp, totalTimeLabel);
+        
         seekBar = new ProgressBar(0);
-        seekBar.setMaxWidth(Double.MAX_VALUE);
+        seekBar.setMaxWidth(Double.MAX_VALUE); 
         seekBar.setStyle("-fx-accent: #a855f7; -fx-pref-height: 4px;");
-
-        section.getChildren().addAll(timeRow, seekBar);
-        return section;
+        
+        sec.getChildren().addAll(tRow, seekBar);
+        return sec;
     }
 
     private HBox buildVolumeSection() {
-        HBox section = new HBox(10);
-        section.setAlignment(Pos.CENTER_LEFT);
-        Label volIcon = new Label("🔊");
-        Slider volumeSlider = new Slider(0, 1.0, 0.7);
-        HBox.setHgrow(volumeSlider, Priority.ALWAYS);
-
-        volumeSlider.valueProperty().addListener((obs, old, val) -> {
-            if (mediaPlayer != null) mediaPlayer.setVolume(val.doubleValue());
+        Slider vSlider = new Slider(0, 1.0, 0.7); 
+        HBox.setHgrow(vSlider, Priority.ALWAYS);
+        vSlider.valueProperty().addListener((obs, old, val) -> { 
+            if (mediaPlayer != null) mediaPlayer.setVolume(val.doubleValue()); 
         });
-
-        section.getChildren().addAll(volIcon, volumeSlider);
-        return section;
+        
+        HBox sec = new HBox(10);
+        sec.setAlignment(Pos.CENTER_LEFT);
+        sec.getChildren().addAll(new Label("🔊"), vSlider);
+        return sec;
     }
 
     private VBox buildAddToPlaylistSection() {
-        VBox section = new VBox(8);
-        section.setPadding(new Insets(15, 0, 0, 0));
-
-        Label label = new Label("ADD CURRENT SONG TO:");
-        label.setStyle("-fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: rgba(255,255,255,0.3);");
-
-        playlistSelector.setPromptText("Choose playlist...");
+        VBox sec = new VBox(8); 
+        sec.setPadding(new Insets(15, 0, 0, 0));
+        
+        Label lbl = new Label("ADD CURRENT SONG TO:"); 
+        lbl.setStyle("-fx-font-size: 11px; -fx-font-weight: bold; -fx-text-fill: rgba(255,255,255,0.3);");
+        
+        playlistSelector.setPromptText("Choose playlist..."); 
         playlistSelector.setMaxWidth(Double.MAX_VALUE);
         playlistSelector.setStyle("-fx-background-color: #1a1a2e; -fx-text-fill: white; -fx-background-radius: 10; -fx-padding: 5;");
-        
-        playlistSelector.setCellFactory(lv -> new javafx.scene.control.ListCell<>() {
-            @Override protected void updateItem(String item, boolean empty) {
-                super.updateItem(item, empty);
-                setText(empty ? null : item);
-                setStyle("-fx-background-color: #1a1a2e; -fx-text-fill: white;");
-            }
+        playlistSelector.setCellFactory(lv -> new ListCell<>() { 
+            @Override protected void updateItem(String i, boolean e) { 
+                super.updateItem(i, e); 
+                setText(e ? null : i); 
+                setStyle("-fx-background-color: #1a1a2e; -fx-text-fill: white;"); 
+            } 
         });
 
-        Button addToPlBtn = new Button("➕ Add to Selected Playlist");
-        addToPlBtn.setMaxWidth(Double.MAX_VALUE);
-        addToPlBtn.setStyle("-fx-background-color: #ffffff10; -fx-text-fill: white; -fx-font-weight: bold; -fx-font-size: 12px; -fx-background-radius: 12; -fx-padding: 8; -fx-cursor: hand;");
-
-        addToPlBtn.setOnAction(e -> {
-            String selectedPlaylist = playlistSelector.getValue();
-            if (selectedPlaylist == null) {
-                Alert alert = new Alert(Alert.AlertType.WARNING);
-                alert.setTitle("Pilih Playlist");
-                alert.setHeaderText(null);
-                alert.setContentText("Wajib milih nama playlist dulu di menu drop-down atas bre!");
-                alert.showAndWait();
-                return;
+        Button addB = new Button("➕ Add to Selected Playlist");
+        addB.setMaxWidth(Double.MAX_VALUE); 
+        addB.setStyle("-fx-background-color: #ffffff10; -fx-text-fill: white; -fx-font-weight: bold; -fx-font-size: 12px; -fx-background-radius: 12; -fx-padding: 8; -fx-cursor: hand;");
+        
+        addB.setOnAction(e -> {
+            String sel = playlistSelector.getValue();
+            if (sel == null) { 
+                Alert w = new Alert(Alert.AlertType.WARNING);
+                w.setHeaderText(null);
+                w.setContentText("Pilih playlist kustom dulu bre!");
+                w.show(); 
+                return; 
             }
             if (currentSong != null) {
-                ObservableList<Song> songsInPlaylist = playlistMap.get(selectedPlaylist);
-                if (songsInPlaylist != null && !songsInPlaylist.contains(currentSong)) {
-                    songsInPlaylist.add(currentSong);
-                    updatePlaylistSidebarCounter(selectedPlaylist, songsInPlaylist.size());
-                    
-                    Alert success = new Alert(Alert.AlertType.INFORMATION);
-                    success.setHeaderText(null);
-                    success.setContentText("Berhasil masukin lagu ke " + selectedPlaylist + "!");
-                    success.show();
+                ObservableList<Song> sList = playlistMap.get(sel);
+                if (sList != null && !sList.contains(currentSong)) {
+                    sList.add(currentSong);
+                    for (Node n : customPlaylistContainer.getChildren()) {
+                        if (n instanceof HBox) {
+                            HBox row = (HBox) n;
+                            VBox infoBox = (VBox) row.getChildren().get(1);
+                            Label nameLbl = (Label) infoBox.getChildren().get(0);
+                            Label countLbl = (Label) infoBox.getChildren().get(1);
+                            
+                            if (nameLbl.getText().equals(sel)) {
+                                countLbl.setText(sList.size() + " songs"); 
+                                break;
+                            }
+                        }
+                    }
+                    Alert s = new Alert(Alert.AlertType.INFORMATION);
+                    s.setHeaderText(null);
+                    s.setContentText("Berhasil ditambahkan!");
+                    s.show();
                 }
             }
         });
-
-        section.getChildren().addAll(label, playlistSelector, addToPlBtn);
-        return section;
-    }
-
-    private void updatePlaylistSidebarCounter(String playlistName, int count) {
-        for (Node node : customPlaylistContainer.getChildren()) {
-            if (node instanceof HBox) {
-                HBox row = (HBox) node;
-                VBox infoVBox = (VBox) row.getChildren().get(1);
-                Label nameLbl = (Label) infoVBox.getChildren().get(0);
-                if (nameLbl.getText().equals(playlistName)) {
-                    Label countLbl = (Label) infoVBox.getChildren().get(1);
-                    countLbl.setText(count + " songs");
-                    break;
-                }
-            }
-        }
+        
+        sec.getChildren().addAll(lbl, playlistSelector, addB);
+        return sec;
     }
 
     // ============================================================
-    // PLAYER CONTROLS & MEDIA LOGIC
+    // BOTTOM PLAYER CONTROLS
     // ============================================================
     private HBox buildPlayerControls() {
-        HBox controls = new HBox(30);
-        controls.setPadding(new Insets(15, 30, 20, 30));
-        controls.setAlignment(Pos.CENTER);
+        HBox controls = new HBox(30); 
+        controls.setPadding(new Insets(15, 30, 20, 30)); 
+        controls.setAlignment(Pos.CENTER); 
         controls.setStyle("-fx-background-color: #0d0d1a; -fx-border-color: #1e1e3a transparent transparent transparent;");
-
-        Label prevBtn = new Label("⏮"); prevBtn.setStyle("-fx-font-size: 20px; -fx-text-fill: white; -fx-cursor: hand;");
-        playBtn = new Label("▶");
-        playBtn.setStyle("-fx-font-size: 24px; -fx-text-fill: white; -fx-background-color: #a855f7; -fx-background-radius: 50; -fx-padding: 10 15 10 15; -fx-cursor: hand;");
-        Label nextBtn = new Label("⏭"); nextBtn.setStyle("-fx-font-size: 20px; -fx-text-fill: white; -fx-cursor: hand;");
+        
+        Label prev = new Label("⏮"); 
+        prev.setStyle("-fx-font-size: 20px; -fx-text-fill: white; -fx-cursor: hand;");
+        
+        playBtn = new Label("▶"); 
+        playBtn.setStyle("-fx-font-size: 24px; -fx-text-fill: white; -fx-background-color: #a855f7; -fx-background-radius: 50; -fx-padding: 10 15; -fx-cursor: hand;");
+        
+        Label next = new Label("⏭"); 
+        next.setStyle("-fx-font-size: 20px; -fx-text-fill: white; -fx-cursor: hand;");
 
         playBtn.setOnMouseClicked(e -> togglePlay());
-        prevBtn.setOnMouseClicked(e -> handlePrev());
-        nextBtn.setOnMouseClicked(e -> handleNext());
-
-        controls.getChildren().addAll(prevBtn, playBtn, nextBtn);
+        prev.setOnMouseClicked(e -> handlePrev());
+        next.setOnMouseClicked(e -> handleNext());
+        
+        controls.getChildren().addAll(prev, playBtn, next);
         return controls;
     }
 
-    private void playSong(Song song) {
-        if (mediaPlayer != null) {
-            mediaPlayer.stop();
+private void playSong(Song song) {
+        if (mediaPlayer != null) { 
+            mediaPlayer.stop(); 
             mediaPlayer.dispose(); 
         }
-
         currentSong = song;
         currentIndex = allSongs.indexOf(song);
         isPlaying = true;
-        
         nowPlayingTitle.setText(song.getTitle());
         nowPlayingArtist.setText(song.getArtist());
         playBtn.setText("⏸");
-        
         refreshSongList();
 
         try {
@@ -772,6 +835,9 @@ public class PlaylistController {
                 audioUrl = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"; 
             }
             
+            // Jaga-jaga kalau link dari Supabase ada spasinya biar Java gak error
+            audioUrl = audioUrl.replace(" ", "%20");
+
             Media media = new Media(audioUrl);
             mediaPlayer = new MediaPlayer(media);
             mediaPlayer.setVolume(0.7);
@@ -779,7 +845,7 @@ public class PlaylistController {
             mediaPlayer.currentTimeProperty().addListener((obs, oldTime, newTime) -> {
                 Platform.runLater(() -> {
                     if (mediaPlayer.getTotalDuration() != null) {
-                        double current = newTime.toSeconds();
+                        double current = newTime.toSeconds(); 
                         double total = mediaPlayer.getTotalDuration().toSeconds();
                         if (total > 0) {
                             seekBar.setProgress(current / total);
@@ -791,242 +857,149 @@ public class PlaylistController {
                 });
             });
 
+            // MESIN SINKRONISASI WAKTU
             mediaPlayer.setOnReady(() -> {
                 Platform.runLater(() -> {
+                    // 1. Ambil durasi asli dari file MP3-nya
                     double total = mediaPlayer.getTotalDuration().toSeconds();
                     int totalMin = (int) total / 60;
                     int totalSec = (int) total % 60;
-                    totalTimeLabel.setText(String.format("%d:%02d", totalMin, totalSec));
+                    String realDuration = String.format("%d:%02d", totalMin, totalSec);
+                    
+                    // 2. Tampilkan di player kanan bawah
+                    totalTimeLabel.setText(realDuration);
+
+                    // 3. JURUS MAGIC: Ubah angka "3:30" bawaan database jadi durasi asli di list layar tengah!
+                    if (currentSong != null) {
+                        currentSong.setDuration(realDuration);
+                        refreshSongList(); 
+                    }
                 });
             });
 
             mediaPlayer.play();
             mediaPlayer.setOnEndOfMedia(this::handleNext);
-
-        } catch (Exception e) {
-            System.err.println("Gagal memutar audio: " + e.getMessage());
+        } catch (Exception e) { 
+            System.err.println("Gagal memutar audio: " + e.getMessage()); 
         }
     }
 
     private void togglePlay() {
-        if (currentSong == null && !allSongs.isEmpty()) {
-            playSong(allSongs.get(0));
+        // Kalau database bener-bener kosong, tombolnya ga usah ngapa-ngapain
+        if (allSongs.isEmpty()) return;
+
+        // Kalau mesin pemutar belum nyala (karena baru buka aplikasi)
+        if (mediaPlayer == null) {
+            if (currentSong == null) {
+                // Putar lagu urutan pertama
+                playSong(allSongs.get(0));
+            } else {
+                // Putar lagu yang lagi mejeng di panel kanan
+                playSong(currentSong);
+            }
             return;
         }
-        if (mediaPlayer == null) return;
 
+        // Kalau mesin udah nyala, tinggal pause atau resume kayak biasa
         isPlaying = !isPlaying;
-        if (isPlaying) {
-            mediaPlayer.play();
-            playBtn.setText("⏸");
-        } else {
-            mediaPlayer.pause();
-            playBtn.setText("▶");
+        if (isPlaying) { 
+            mediaPlayer.play(); 
+            playBtn.setText("⏸"); 
+        } else { 
+            mediaPlayer.pause(); 
+            playBtn.setText("▶"); 
         }
     }
 
-    private void handleNext() {
-        if (allSongs.isEmpty()) return;
-        currentIndex = (currentIndex + 1) % allSongs.size();
-        playSong(allSongs.get(currentIndex));
+    private void handleNext() { 
+        if (!allSongs.isEmpty()) { 
+            currentIndex = (currentIndex + 1) % allSongs.size(); 
+            playSong(allSongs.get(currentIndex)); 
+        } 
+    }
+    
+    private void handlePrev() { 
+        if (!allSongs.isEmpty()) { 
+            currentIndex = (currentIndex - 1 + allSongs.size()) % allSongs.size(); 
+            playSong(allSongs.get(currentIndex)); 
+        } 
     }
 
-    private void handlePrev() {
-        if (allSongs.isEmpty()) return;
-        currentIndex = (currentIndex - 1 + allSongs.size()) % allSongs.size();
-        playSong(allSongs.get(currentIndex));
-    }
-
-    private void restoreSongsByActiveMenu(String currentMenu) {
-        if (currentMenu.equals("Liked Songs")) {
-            allSongs.stream().filter(Song::isLiked).forEach(filteredSongs::add);
-        } else if (currentMenu.equals("Radio") || currentMenu.equals("Downloads")) {
-            // Kosong
-        } else {
-            ObservableList<Song> saved = playlistMap.get(currentMenu);
-            if (saved != null) filteredSongs.addAll(saved);
-            else filteredSongs.addAll(allSongs);
-        }
-    }
-
-    // ============================================================
-    // WINDOW DRAG & ANIMATIONS
-    // ============================================================
-    private double xOffset = 0, yOffset = 0;
-    private void enableDrag(Node root, Stage stage) {
-        root.setOnMousePressed(e -> { xOffset = e.getSceneX(); yOffset = e.getSceneY(); });
-        root.setOnMouseDragged(e -> { if (yOffset < 60) { stage.setX(e.getScreenX() - xOffset); stage.setY(e.getScreenY() - yOffset); } });
-    }
-
-    private void playEntryAnimation(Node root) {
-        root.setOpacity(0); root.setScaleX(0.95); root.setScaleY(0.95);
-        new ParallelTransition(createFadeIn(root, 500), createScaleIn(root, 500)).play();
-    }
-
-    private FadeTransition createFadeIn(Node node, int ms) {
-        FadeTransition ft = new FadeTransition(Duration.millis(ms), node);
-        ft.setToValue(1); ft.setInterpolator(Interpolator.EASE_OUT); return ft;
-    }
-
-    private TranslateTransition createSlideRight(Node node, int ms) {
-        TranslateTransition tt = new TranslateTransition(Duration.millis(ms), node);
-        tt.setToX(0); tt.setInterpolator(Interpolator.EASE_OUT); return tt;
-    }
-
-    private ScaleTransition createScaleIn(Node node, int ms) {
-        ScaleTransition st = new ScaleTransition(Duration.millis(ms), node);
-        st.setToX(1.0); st.setToY(1.0); st.setInterpolator(Interpolator.SPLINE(0.25, 0.1, 0.25, 1.0)); return st;
-    }
-
-    // ============================================================
-    // FITUR ADD SONG & BACKEND SUPABASE
-    // ============================================================
-    private void openAddSongDialog() {
-        Dialog<Song> dialog = new Dialog<>();
-        dialog.setTitle("Tambah Lagu Baru");
-        dialog.setHeaderText("Masukkan detail lagu buat dikirim ke Supabase 🚀");
+private void openAddSongDialog() {
+        Dialog<Song> dialog = new Dialog<>(); 
+        dialog.setTitle("Tambah Lagu Baru"); 
         dialog.initStyle(StageStyle.UTILITY);
-
-        ButtonType saveButtonType = new ButtonType("Save to Database", ButtonData.OK_DONE);
+        
+        ButtonType saveButtonType = new ButtonType("Save to Supabase", ButtonData.OK_DONE);
         dialog.getDialogPane().getButtonTypes().addAll(saveButtonType, ButtonType.CANCEL);
-
+        
         GridPane grid = new GridPane();
-        grid.setHgap(10); grid.setVgap(10);
+        grid.setHgap(10); 
+        grid.setVgap(10); 
         grid.setPadding(new Insets(20, 150, 10, 10));
-
-        TextField titleField = new TextField(); titleField.setPromptText("Judul Lagu (ex: Secukupnya)");
-        TextField artistField = new TextField(); artistField.setPromptText("Artis (ex: Hindia)");
-        TextField albumField = new TextField(); albumField.setPromptText("Album");
-        TextField genreField = new TextField(); genreField.setPromptText("Genre (ex: Indie)");
-        TextField durationField = new TextField(); durationField.setPromptText("Durasi (ex: 3:45)");
-        TextField emojiField = new TextField(); emojiField.setPromptText("Emoji Foto (ex: 🎸)");
-        TextField urlField = new TextField(); urlField.setPromptText("URL MP3 (Link Supabase Storage)");
-
-        grid.add(new Label("Judul:"), 0, 0); grid.add(titleField, 1, 0);
-        grid.add(new Label("Artis:"), 0, 1); grid.add(artistField, 1, 1);
-        grid.add(new Label("Album:"), 0, 2); grid.add(albumField, 1, 2);
-        grid.add(new Label("Genre:"), 0, 3); grid.add(genreField, 1, 3);
-        grid.add(new Label("Durasi:"), 0, 4); grid.add(durationField, 1, 4);
-        grid.add(new Label("Emoji Foto:"), 0, 5); grid.add(emojiField, 1, 5);
-        grid.add(new Label("Link MP3:"), 0, 6); grid.add(urlField, 1, 6);
-
+        
+        TextField t = new TextField(); t.setPromptText("Judul");
+        TextField a = new TextField(); a.setPromptText("Artis");
+        TextField al = new TextField(); al.setPromptText("Album");
+        TextField g = new TextField(); g.setPromptText("Genre");
+        TextField d = new TextField(); d.setPromptText("Durasi");
+        TextField e = new TextField(); e.setPromptText("Emoji");
+        TextField u = new TextField(); u.setPromptText("URL MP3 (Link Supabase Storage)");
+        
+        grid.addRow(0, new Label("Judul:"), t); 
+        grid.addRow(1, new Label("Artis:"), a); 
+        grid.addRow(2, new Label("Album:"), al);
+        grid.addRow(3, new Label("Genre:"), g); 
+        grid.addRow(4, new Label("Durasi:"), d); 
+        grid.addRow(5, new Label("Emoji:"), e); 
+        grid.addRow(6, new Label("URL MP3:"), u); 
+        
         dialog.getDialogPane().setContent(grid);
-
-        dialog.setResultConverter(dialogButton -> {
-            if (dialogButton == saveButtonType) {
-                return new Song(
-                    titleField.getText(), artistField.getText(), albumField.getText(),
-                    durationField.getText(), genreField.getText(), emojiField.getText()
-                );
+        
+        dialog.setResultConverter(btn -> {
+            if (btn == saveButtonType) {
+                return new Song(t.getText(), a.getText(), al.getText(), d.getText(), g.getText(), e.getText());
             }
             return null;
         });
-
-        Optional<Song> result = dialog.showAndWait();
-
-        result.ifPresent(newSong -> {
-            newSong.setFileUrl(urlField.getText());
-            saveSongToSupabase(newSong);
+        
+        dialog.showAndWait().ifPresent(s -> { 
+            // Langsung ambil text dari kolom URL apa adanya
+            s.setFileUrl(u.getText().trim()); 
+            saveSongToSupabase(s); 
         });
     }
 
-    private void saveSongToSupabase(Song song) {
-        String sql = "INSERT INTO songs (title, artist, album, duration, genre, cover_emoji, file_url) VALUES (?, ?, ?, ?, ?, ?, ?)";
-
-        try (Connection conn = com.musicplayer.model.DatabaseConfig.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-
-            pstmt.setString(1, song.getTitle());
-            pstmt.setString(2, song.getArtist());
-            pstmt.setString(3, song.getAlbum());
-            pstmt.setString(4, song.getDuration());
-            pstmt.setString(5, song.getGenre());
-            pstmt.setString(6, song.getCoverEmoji());
-            pstmt.setString(7, song.getFileUrl());
-
-            int affectedRows = pstmt.executeUpdate();
-
-            if (affectedRows > 0) {
-                allSongs.add(song);
-                filteredSongs.add(song);
-                refreshSongList();
-
-                Alert success = new Alert(Alert.AlertType.INFORMATION);
-                success.setTitle("Supabase Connected!");
-                success.setHeaderText(null);
-                success.setContentText("Lagu '" + song.getTitle() + "' berhasil mendarat di Supabase Cloud!");
-                success.show();
-            }
-
-        } catch (Exception e) {
-            allSongs.add(song);
-            filteredSongs.add(song);
-            refreshSongList();
-            
-            Alert error = new Alert(Alert.AlertType.WARNING);
-            error.setTitle("Database Warning");
-            error.setHeaderText("Supabase Belum Konek bre!");
-            error.setContentText("Lagu berhasil ditambahkan di aplikasi lokal, tapi gagal masuk ke Supabase Cloud.\nError: " + e.getMessage());
-            error.show();
-            e.printStackTrace();
-        }
+    // ============================================================
+    // WINDOW EFFECTS & ANIMATIONS
+    // ============================================================
+    private double xOffset = 0, yOffset = 0;
+    private void enableDrag(Node root, Stage stage) {
+        root.setOnMousePressed(e -> { 
+            xOffset = e.getSceneX(); 
+            yOffset = e.getSceneY(); 
+        });
+        root.setOnMouseDragged(e -> { 
+            if (yOffset < 60) { 
+                stage.setX(e.getScreenX() - xOffset); 
+                stage.setY(e.getScreenY() - yOffset); 
+            } 
+        });
     }
 
-    // ============================================================
-    // FITUR DELETE SONG DARI SUPABASE
-    // ============================================================
-    private void deleteSongFromSupabase(Song song) {
-        String sql = "DELETE FROM songs WHERE title = ? AND artist = ?";
-
-        try (Connection conn = com.musicplayer.model.DatabaseConfig.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-
-            pstmt.setString(1, song.getTitle());
-            pstmt.setString(2, song.getArtist());
-            
-            pstmt.executeUpdate();
-
-            allSongs.remove(song);
-            filteredSongs.remove(song);
-            
-            for (ObservableList<Song> pl : playlistMap.values()) {
-                pl.remove(song);
-            }
-
-            refreshSongList();
-
-            if (currentSong == song) {
-                if (mediaPlayer != null) {
-                    mediaPlayer.stop();
-                    mediaPlayer.dispose();
-                    mediaPlayer = null;
-                }
-                currentSong = null;
-                isPlaying = false;
-                nowPlayingTitle.setText("No Song");
-                nowPlayingArtist.setText("Unknown Artist");
-                playBtn.setText("▶");
-                currentTimeLabel.setText("0:00");
-                totalTimeLabel.setText("0:00");
-                seekBar.setProgress(0);
-            }
-
-            Alert success = new Alert(Alert.AlertType.INFORMATION);
-            success.setHeaderText(null);
-            success.setContentText("Lagu '" + song.getTitle() + "' berhasil dilenyapkan dari muka bumi!");
-            success.show();
-
-        } catch (Exception e) {
-            allSongs.remove(song);
-            filteredSongs.remove(song);
-            refreshSongList();
-            
-            Alert error = new Alert(Alert.AlertType.WARNING);
-            error.setTitle("Database Warning");
-            error.setHeaderText("Gagal hapus di awan!");
-            error.setContentText("Lagu terhapus dari layar, tapi gagal dihapus dari Supabase Cloud.\nError: " + e.getMessage());
-            error.show();
-            e.printStackTrace();
-        }
+    private void playEntryAnimation(Node root) {
+        root.setOpacity(0); 
+        root.setScaleX(0.95); 
+        root.setScaleY(0.95);
+        
+        FadeTransition ft = new FadeTransition(Duration.millis(500), root);
+        ft.setToValue(1);
+        
+        ScaleTransition st = new ScaleTransition(Duration.millis(500), root);
+        st.setToX(1.0); 
+        st.setToY(1.0);
+        
+        ParallelTransition pt = new ParallelTransition(ft, st);
+        pt.play();
     }
 }
